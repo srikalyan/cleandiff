@@ -2,6 +2,101 @@ import SwiftUI
 import AppKit
 import CleanDiffCore
 
+// MARK: - Custom TextField with Enter Key Support
+
+struct EditableTextField: NSViewRepresentable {
+    @Binding var text: String
+    let font: NSFont
+    let wordWrap: Bool
+    let onEnterPressed: () -> Void
+    let onTextChanged: (String) -> Void
+
+    func makeNSView(context: Context) -> NSScrollView {
+        let scrollView = NSScrollView()
+        let textField = NSTextField()
+
+        textField.delegate = context.coordinator
+        textField.font = font
+        textField.isBordered = false
+        textField.backgroundColor = .clear
+        textField.focusRingType = .none
+        textField.drawsBackground = false
+
+        if wordWrap {
+            textField.lineBreakMode = .byWordWrapping
+            textField.cell?.wraps = true
+            textField.cell?.isScrollable = false
+        } else {
+            textField.lineBreakMode = .byClipping
+            textField.cell?.truncatesLastVisibleLine = false
+            textField.cell?.wraps = false
+            textField.cell?.isScrollable = true
+        }
+
+        scrollView.documentView = textField
+        scrollView.hasHorizontalScroller = !wordWrap
+        scrollView.hasVerticalScroller = false
+        scrollView.autohidesScrollers = true
+        scrollView.borderType = .noBorder
+        scrollView.drawsBackground = false
+
+        // Set up autoresizing
+        textField.translatesAutoresizingMaskIntoConstraints = false
+        if wordWrap {
+            textField.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        }
+
+        return scrollView
+    }
+
+    func updateNSView(_ nsView: NSScrollView, context: Context) {
+        guard let textField = nsView.documentView as? NSTextField else { return }
+        if textField.stringValue != text {
+            textField.stringValue = text
+        }
+        textField.font = font
+
+        // Update word wrap settings
+        if wordWrap {
+            textField.lineBreakMode = .byWordWrapping
+            textField.cell?.wraps = true
+            textField.cell?.isScrollable = false
+        } else {
+            textField.lineBreakMode = .byClipping
+            textField.cell?.wraps = false
+            textField.cell?.isScrollable = true
+        }
+        nsView.hasHorizontalScroller = !wordWrap
+    }
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(self)
+    }
+
+    class Coordinator: NSObject, NSTextFieldDelegate {
+        var parent: EditableTextField
+
+        init(_ parent: EditableTextField) {
+            self.parent = parent
+        }
+
+        func controlTextDidChange(_ obj: Notification) {
+            guard let textField = obj.object as? NSTextField else { return }
+            parent.text = textField.stringValue
+            parent.onTextChanged(textField.stringValue)
+        }
+
+        func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
+            if commandSelector == #selector(NSResponder.insertNewline(_:)) {
+                // Handle Enter key - insert new line below
+                parent.onEnterPressed()
+                return true  // We handled it
+            }
+            return false  // Let the system handle other commands
+        }
+    }
+}
+
 // MARK: - Scroll Sync Coordinator
 
 class ScrollSyncCoordinator: ObservableObject {
@@ -55,11 +150,12 @@ struct FileDiffView: View {
     @ObservedObject var viewModel: ComparisonViewModel
     @AppStorage("fontSize") private var fontSize = 12.0
     @AppStorage("showLineNumbers") private var showLineNumbers = true
+    @AppStorage("wordWrap") private var wordWrap = false
 
     var body: some View {
         VStack(spacing: 0) {
             // Toolbar
-            DiffToolbar(viewModel: viewModel)
+            DiffToolbar(viewModel: viewModel, wordWrap: $wordWrap)
 
             // Main diff area - aligned view
             AlignedDiffView(
@@ -68,6 +164,7 @@ struct FileDiffView: View {
                 rightTitle: viewModel.comparison.rightURL.lastPathComponent,
                 fontSize: fontSize,
                 showLineNumbers: showLineNumbers,
+                wordWrap: wordWrap,
                 selectedChunkIndex: viewModel.selectedChunkIndex,
                 allChunks: viewModel.chunks,
                 leftContent: $viewModel.leftContent,
@@ -101,6 +198,7 @@ struct AlignedDiffView: View {
     let rightTitle: String
     let fontSize: Double
     let showLineNumbers: Bool
+    let wordWrap: Bool
     let selectedChunkIndex: Int?
     let allChunks: [DiffChunk]
     @Binding var leftContent: String
@@ -115,7 +213,8 @@ struct AlignedDiffView: View {
     let isRightModified: Bool
 
     init(alignedLines: [AlignedLine], leftTitle: String, rightTitle: String,
-         fontSize: Double, showLineNumbers: Bool, selectedChunkIndex: Int?, allChunks: [DiffChunk],
+         fontSize: Double, showLineNumbers: Bool, wordWrap: Bool,
+         selectedChunkIndex: Int?, allChunks: [DiffChunk],
          leftContent: Binding<String>, rightContent: Binding<String>,
          isLeftEditable: Bool, isRightEditable: Bool,
          isLeftModified: Bool, isRightModified: Bool,
@@ -125,6 +224,7 @@ struct AlignedDiffView: View {
         self.rightTitle = rightTitle
         self.fontSize = fontSize
         self.showLineNumbers = showLineNumbers
+        self.wordWrap = wordWrap
         self.selectedChunkIndex = selectedChunkIndex
         self.allChunks = allChunks
         self._leftContent = leftContent
@@ -201,6 +301,7 @@ struct AlignedDiffView: View {
                                     fontSize: fontSize,
                                     lineHeight: lineHeight,
                                     showLineNumbers: showLineNumbers,
+                                    wordWrap: wordWrap,
                                     isSelected: isLineInSelectedChunk(line, side: .left),
                                     minWidth: geometry.size.width / 2 - 10,
                                     isEditable: isLeftEditable,
@@ -279,6 +380,7 @@ struct AlignedDiffView: View {
                                     fontSize: fontSize,
                                     lineHeight: lineHeight,
                                     showLineNumbers: showLineNumbers,
+                                    wordWrap: wordWrap,
                                     isSelected: isLineInSelectedChunk(line, side: .right),
                                     minWidth: geometry.size.width / 2 - 10,
                                     isEditable: isRightEditable,
@@ -453,6 +555,7 @@ struct EditableLineRow: View {
     let fontSize: Double
     let lineHeight: CGFloat
     let showLineNumbers: Bool
+    let wordWrap: Bool
     let isSelected: Bool
     let minWidth: CGFloat
     let isEditable: Bool
@@ -462,7 +565,6 @@ struct EditableLineRow: View {
     @State private var editText: String = ""
     @State private var originalText: String = ""  // Track original to detect real changes
     @State private var isInitialized: Bool = false
-    @FocusState private var isFocused: Bool
 
     private var text: String? {
         side == .left ? line.leftText : line.rightText
@@ -534,44 +636,44 @@ struct EditableLineRow: View {
                     .fill(Color.clear)
                     .frame(minWidth: minWidth - (showLineNumbers ? 47 : 0), maxWidth: .infinity)
             } else if isEditable {
-                // Editable TextField
-                TextField("", text: $editText)
-                    .textFieldStyle(.plain)
-                    .font(.system(size: fontSize, design: .monospaced))
-                    .focused($isFocused)
-                    .frame(minWidth: minWidth - (showLineNumbers ? 47 : 0), maxWidth: .infinity, alignment: .leading)
-                    .padding(.leading, 4)
-                    .onAppear {
-                        let t = text ?? ""
-                        editText = t
-                        originalText = t
-                        // Mark as initialized after a short delay
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                            isInitialized = true
-                        }
-                    }
-                    .onChange(of: text) { _, newValue in
-                        let t = newValue ?? ""
-                        editText = t
-                        originalText = t
-                    }
-                    .onSubmit {
+                // Editable TextField with Enter key support
+                EditableTextField(
+                    text: $editText,
+                    font: NSFont.monospacedSystemFont(ofSize: fontSize, weight: .regular),
+                    wordWrap: wordWrap,
+                    onEnterPressed: {
                         // First save any pending edit
                         if isInitialized && editText != originalText {
                             onEdit(editText)
                             originalText = editText
                         }
-                        // Then insert a new line below (Enter key behavior)
+                        // Then insert a new line below
                         if isInitialized {
                             onInsertLineBelow()
                         }
-                    }
-                    .onChange(of: isFocused) { _, focused in
-                        if !focused && isInitialized && editText != originalText {
-                            onEdit(editText)
-                            originalText = editText
+                    },
+                    onTextChanged: { newText in
+                        if isInitialized && newText != originalText {
+                            onEdit(newText)
+                            originalText = newText
                         }
                     }
+                )
+                .frame(minWidth: minWidth - (showLineNumbers ? 47 : 0), maxWidth: .infinity, minHeight: lineHeight)
+                .padding(.leading, 4)
+                .onAppear {
+                    let t = text ?? ""
+                    editText = t
+                    originalText = t
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                        isInitialized = true
+                    }
+                }
+                .onChange(of: text) { _, newValue in
+                    let t = newValue ?? ""
+                    editText = t
+                    originalText = t
+                }
             } else {
                 // Read-only Text
                 Text(text ?? "")
@@ -587,6 +689,8 @@ struct EditableLineRow: View {
 
 struct DiffToolbar: View {
     @ObservedObject var viewModel: ComparisonViewModel
+    @Binding var wordWrap: Bool
+    @Environment(\.undoManager) private var undoManager
 
     var body: some View {
         HStack {
@@ -595,13 +699,15 @@ struct DiffToolbar: View {
                 Image(systemName: "chevron.up")
             }
             .disabled(!viewModel.hasPreviousChunk)
-            .help("Previous change")
+            .help("Previous change (⌘↑)")
+            .keyboardShortcut(.upArrow, modifiers: .command)
 
             Button(action: { viewModel.nextChunk() }) {
                 Image(systemName: "chevron.down")
             }
             .disabled(!viewModel.hasNextChunk)
-            .help("Next change")
+            .help("Next change (⌘↓)")
+            .keyboardShortcut(.downArrow, modifiers: .command)
 
             Text("\(viewModel.currentChunkIndex + 1) of \(viewModel.chunks.count) changes")
                 .foregroundColor(.secondary)
@@ -609,7 +715,34 @@ struct DiffToolbar: View {
 
             Spacer()
 
-            // Actions
+            // Edit actions
+            Button(action: { undoManager?.undo() }) {
+                Image(systemName: "arrow.uturn.backward")
+            }
+            .disabled(!(undoManager?.canUndo ?? false))
+            .help("Undo (⌘Z)")
+            .keyboardShortcut("z", modifiers: .command)
+
+            Button(action: { undoManager?.redo() }) {
+                Image(systemName: "arrow.uturn.forward")
+            }
+            .disabled(!(undoManager?.canRedo ?? false))
+            .help("Redo (⌘⇧Z)")
+            .keyboardShortcut("z", modifiers: [.command, .shift])
+
+            Divider()
+                .frame(height: 16)
+
+            // Word wrap toggle
+            Button(action: { wordWrap.toggle() }) {
+                Image(systemName: wordWrap ? "text.alignleft" : "arrow.left.and.right.text.vertical")
+            }
+            .help(wordWrap ? "Disable word wrap" : "Enable word wrap")
+
+            Divider()
+                .frame(height: 16)
+
+            // File actions
             Button(action: {
                 Task {
                     try? await viewModel.saveAll()
@@ -617,7 +750,8 @@ struct DiffToolbar: View {
             }) {
                 Image(systemName: "square.and.arrow.down")
             }
-            .help("Save all")
+            .help("Save all (⌘S)")
+            .keyboardShortcut("s", modifiers: .command)
 
             Button(action: {
                 Task {
@@ -626,7 +760,8 @@ struct DiffToolbar: View {
             }) {
                 Image(systemName: "arrow.clockwise")
             }
-            .help("Refresh")
+            .help("Refresh (⌘R)")
+            .keyboardShortcut("r", modifiers: .command)
         }
         .padding(.horizontal)
         .padding(.vertical, 8)
