@@ -1,0 +1,37 @@
+name: Auto Merge
+
+on:
+  pull_request:
+    types: [labeled]
+
+jobs:
+  auto-merge:
+    name: Enable Auto Merge
+    runs-on: ubuntu-latest
+    if: github.event.label.name == 'shipit'
+
+    permissions:
+      contents: write
+      pull-requests: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Check if user is a code owner
+        env:
+          ACTOR: ${{ github.actor }}
+        run: |
+          # Check if user is listed in CODEOWNERS
+          if grep -q "@${ACTOR}" .github/CODEOWNERS; then
+            echo "User '${ACTOR}' is a code owner. Proceeding with auto-merge."
+          else
+            echo "::error::Only code owners can use the shipit label. User '${ACTOR}' is not listed in CODEOWNERS."
+            exit 1
+          fi
+
+      - name: Enable auto-merge
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+        run: gh pr merge --auto --squash "$PR_URL"
