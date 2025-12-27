@@ -1,72 +1,60 @@
 import SwiftUI
 import AppKit
 import CleanDiffCore
+import os
 
-// MARK: - Custom TextField with Enter Key Support
+private let logger = Logger(subsystem: "com.cleandiff", category: "editing")
+
+// MARK: - Custom TextField (No Word Wrap - uses NSTextField)
 
 struct EditableTextField: NSViewRepresentable {
     @Binding var text: String
     let font: NSFont
-    let wordWrap: Bool
-    let onEnterPressed: () -> Void
+    let wordWrap: Bool  // Not used for NSTextField, kept for API compatibility
+    let onEnterPressed: (Int) -> Void  // Pass cursor position
     let onTextChanged: (String) -> Void
+    var onDeleteEmptyLine: (() -> Void)?
+    var shouldFocus: Bool = false
+    var onFocusHandled: (() -> Void)? = nil
 
-    func makeNSView(context: Context) -> NSScrollView {
-        let scrollView = NSScrollView()
+    func makeNSView(context: Context) -> NSTextField {
         let textField = NSTextField()
-
         textField.delegate = context.coordinator
         textField.font = font
         textField.isBordered = false
         textField.backgroundColor = .clear
         textField.focusRingType = .none
         textField.drawsBackground = false
-
-        if wordWrap {
-            textField.lineBreakMode = .byWordWrapping
-            textField.cell?.wraps = true
-            textField.cell?.isScrollable = false
-        } else {
-            textField.lineBreakMode = .byClipping
-            textField.cell?.truncatesLastVisibleLine = false
-            textField.cell?.wraps = false
-            textField.cell?.isScrollable = true
-        }
-
-        scrollView.documentView = textField
-        scrollView.hasHorizontalScroller = !wordWrap
-        scrollView.hasVerticalScroller = false
-        scrollView.autohidesScrollers = true
-        scrollView.borderType = .noBorder
-        scrollView.drawsBackground = false
-
-        // Set up autoresizing
-        textField.translatesAutoresizingMaskIntoConstraints = false
-        if wordWrap {
-            textField.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        }
-
-        return scrollView
+        textField.alignment = .left
+        textField.lineBreakMode = .byClipping
+        textField.cell?.wraps = false
+        textField.cell?.isScrollable = true
+        textField.usesSingleLineMode = true
+        textField.maximumNumberOfLines = 1
+        textField.stringValue = text
+        return textField
     }
 
-    func updateNSView(_ nsView: NSScrollView, context: Context) {
-        guard let textField = nsView.documentView as? NSTextField else { return }
-        if textField.stringValue != text {
-            textField.stringValue = text
+    func updateNSView(_ nsView: NSTextField, context: Context) {
+        // Critical: Update coordinator's parent reference
+        context.coordinator.parent = self
+        
+        if nsView.stringValue != text {
+            nsView.stringValue = text
         }
-        textField.font = font
-
-        // Update word wrap settings
-        if wordWrap {
-            textField.lineBreakMode = .byWordWrapping
-            textField.cell?.wraps = true
-            textField.cell?.isScrollable = false
-        } else {
-            textField.lineBreakMode = .byClipping
-            textField.cell?.wraps = false
-            textField.cell?.isScrollable = true
+        nsView.font = font
+        
+        // Handle focus request
+        if shouldFocus {
+            DispatchQueue.main.async {
+                nsView.window?.makeFirstResponder(nsView)
+                // Position cursor at start
+                if let fieldEditor = nsView.window?.fieldEditor(false, for: nsView) as? NSTextView {
+                    fieldEditor.setSelectedRange(NSRange(location: 0, length: 0))
+                }
+                self.onFocusHandled?()
+            }
         }
-        nsView.hasHorizontalScroller = !wordWrap
     }
 
     func makeCoordinator() -> Coordinator {
@@ -88,11 +76,177 @@ struct EditableTextField: NSViewRepresentable {
 
         func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
             if commandSelector == #selector(NSResponder.insertNewline(_:)) {
-                // Handle Enter key - insert new line below
-                parent.onEnterPressed()
-                return true  // We handled it
+                // Get cursor position and pass to callback
+                let cursorPos = textView.selectedRange().location
+                parent.onEnterPressed(cursorPos)
+                return true
             }
-            return false  // Let the system handle other commands
+            if commandSelector == #selector(NSResponder.deleteBackward(_:)) {
+                if parent.text.isEmpty {
+                    parent.onDeleteEmptyLine?()
+                    return true
+                }
+            }
+            return false
+        }
+    }
+}
+
+// MARK: - Text Height Calculator (Font-agnostic)
+
+/// Calculates the height needed for text at a given width with a given font.
+/// Uses TextKit for accurate measurement - works with any font/size.
+enum TextHeightCalculator {
+    static func height(for text: String, width: CGFloat, font: NSFont) -> CGFloat {
+        guard !text.isEmpty, width > 0 else {
+            return font.pointSize + 8  // Minimum height for empty text
+        }
+
+        let textStorage = NSTextStorage(string: text)
+        textStorage.addAttribute(.font, value: font, range: NSRange(location: 0, length: textStorage.length))
+
+        let textContainer = NSTextContainer(containerSize: NSSize(width: width, height: .greatestFiniteMagnitude))
+        textContainer.lineFragmentPadding = 0
+
+        let layoutManager = NSLayoutManager()
+        layoutManager.addTextContainer(textContainer)
+        textStorage.addLayoutManager(layoutManager)
+
+        layoutManager.ensureLayout(for: textContainer)
+        let usedRect = layoutManager.usedRect(for: textContainer)
+        return max(usedRect.height + 4, font.pointSize + 8)
+    }
+}
+
+// MARK: - Custom TextView (Word Wrap - uses NSTextView)
+
+struct EditableTextView: NSViewRepresentable {
+    @Binding var text: String
+    let font: NSFont
+    let textWidth: CGFloat
+    let onEnterPressed: (Int) -> Void
+    let onTextChanged: (String) -> Void
+    var onDeleteEmptyLine: (() -> Void)?
+    var onSplitLine: ((String, String) -> Void)?
+    var shouldFocus: Bool = false
+    var onFocusHandled: (() -> Void)? = nil
+
+    func makeNSView(context: Context) -> NSScrollView {
+        // Create text view
+        let textView = NSTextView()
+        textView.delegate = context.coordinator
+        textView.font = font
+        textView.backgroundColor = .clear
+        textView.drawsBackground = false
+        textView.isEditable = true
+        textView.isSelectable = true
+        textView.isRichText = false
+        textView.allowsUndo = true
+
+        // Critical: Word wrap configuration
+        textView.isHorizontallyResizable = false
+        textView.isVerticallyResizable = true
+        textView.textContainer?.containerSize = NSSize(width: textWidth, height: .greatestFiniteMagnitude)
+        textView.textContainer?.widthTracksTextView = false
+        textView.textContainer?.lineFragmentPadding = 0
+
+        // Set min/max size to enforce width
+        textView.minSize = NSSize(width: textWidth, height: 0)
+        textView.maxSize = NSSize(width: textWidth, height: .greatestFiniteMagnitude)
+
+        textView.string = text
+
+        // Wrap in scroll view (required for proper NSTextView behavior)
+        let scrollView = NSScrollView()
+        scrollView.documentView = textView
+        scrollView.hasVerticalScroller = false
+        scrollView.hasHorizontalScroller = false
+        scrollView.autohidesScrollers = true
+        scrollView.borderType = .noBorder
+        scrollView.drawsBackground = false
+        scrollView.backgroundColor = .clear
+
+        context.coordinator.textView = textView
+        return scrollView
+    }
+
+    func updateNSView(_ scrollView: NSScrollView, context: Context) {
+        guard let textView = scrollView.documentView as? NSTextView else { return }
+
+        // CRITICAL: Update coordinator's parent reference so callbacks use current closures
+        context.coordinator.parent = self
+
+        if textView.string != text {
+            textView.string = text
+        }
+        textView.font = font
+
+        // Update width constraints
+        textView.textContainer?.containerSize = NSSize(width: textWidth, height: .greatestFiniteMagnitude)
+        textView.minSize = NSSize(width: textWidth, height: 0)
+        textView.maxSize = NSSize(width: textWidth, height: .greatestFiniteMagnitude)
+
+        // Handle focus request
+        if shouldFocus {
+            DispatchQueue.main.async {
+                textView.window?.makeFirstResponder(textView)
+                // Move cursor to start of text
+                textView.setSelectedRange(NSRange(location: 0, length: 0))
+                onFocusHandled?()
+            }
+        }
+    }
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(self)
+    }
+
+    @MainActor
+    class Coordinator: NSObject, NSTextViewDelegate {
+        var parent: EditableTextView
+        weak var textView: NSTextView?
+
+        init(_ parent: EditableTextView) {
+            self.parent = parent
+        }
+
+        func textDidChange(_ notification: Notification) {
+            guard let textView = notification.object as? NSTextView else { return }
+            let newText = textView.string
+
+            // Check for newline (Enter pressed)
+            if newText.contains("\n") {
+                if let newlineIndex = newText.firstIndex(of: "\n") {
+                    let beforeNewline = String(newText[..<newlineIndex])
+                    let afterIndex = newText.index(after: newlineIndex)
+                    let afterNewline = afterIndex < newText.endIndex ? String(newText[afterIndex...]) : ""
+
+                    logger.info("Enter detected - before: '\(beforeNewline.prefix(30), privacy: .public)' after: '\(afterNewline.prefix(30), privacy: .public)'")
+
+                    textView.string = beforeNewline
+                    parent.text = beforeNewline
+
+                    if let splitHandler = parent.onSplitLine {
+                        splitHandler(beforeNewline, afterNewline)
+                    } else {
+                        parent.onTextChanged(beforeNewline)
+                        parent.onEnterPressed(beforeNewline.count)
+                    }
+                }
+            } else {
+                parent.text = newText
+                parent.onTextChanged(newText)
+            }
+        }
+
+        func textView(_ textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
+            if commandSelector == #selector(NSResponder.deleteBackward(_:)) {
+                if parent.text.isEmpty {
+                    parent.onDeleteEmptyLine?()
+                    return true
+                }
+            }
+            return false
         }
     }
 }
@@ -241,6 +395,9 @@ struct AlignedDiffView: View {
     @State private var leftLines: [String] = []
     @State private var rightLines: [String] = []
 
+    // Focus management - which line should receive focus (side, lineNumber)
+    @State private var focusedLine: (side: DiffSide, lineNumber: Int)? = nil
+
     // Determine which side is editable (if both, prefer left)
     private var editableSide: DiffSide? {
         if isLeftEditable && isRightEditable {
@@ -251,6 +408,32 @@ struct AlignedDiffView: View {
             return .right
         }
         return nil  // Neither editable
+    }
+
+    // Calculate maximum line length for horizontal scrolling
+    private var maxLineLength: Int {
+        var maxLen = 0
+        for line in alignedLines {
+            if let left = line.leftText {
+                maxLen = max(maxLen, left.count)
+            }
+            if let right = line.rightText {
+                maxLen = max(maxLen, right.count)
+            }
+        }
+        return maxLen
+    }
+
+    // Calculate content width based on longest line (when word wrap is off)
+    private func contentWidth(paneWidth: CGFloat) -> CGFloat {
+        if wordWrap {
+            return paneWidth
+        }
+        // Estimate character width for monospaced font (roughly 0.6 * fontSize)
+        let charWidth = fontSize * 0.6
+        let lineNumberWidth: CGFloat = showLineNumbers ? 47 : 0
+        let estimatedWidth = CGFloat(maxLineLength) * charWidth + lineNumberWidth + 20
+        return max(paneWidth, estimatedWidth)
     }
 
     var body: some View {
@@ -291,43 +474,49 @@ struct AlignedDiffView: View {
                     .padding(.vertical, 6)
                     .background(Color(NSColor.controlBackgroundColor))
 
-                    // Content - fills remaining space
+                    // Content - fills remaining space with horizontal scroll support
                     ScrollViewReader { proxy in
-                        List {
-                            ForEach(alignedLines) { line in
-                                EditableLineRow(
-                                    line: line,
-                                    side: .left,
-                                    fontSize: fontSize,
-                                    lineHeight: lineHeight,
-                                    showLineNumbers: showLineNumbers,
-                                    wordWrap: wordWrap,
-                                    isSelected: isLineInSelectedChunk(line, side: .left),
-                                    minWidth: geometry.size.width / 2 - 10,
-                                    isEditable: isLeftEditable,
-                                    onEdit: { newText in
-                                        updateLine(lineNumber: line.leftLineNumber, newText: newText, side: .left)
-                                    },
-                                    onInsertLineBelow: {
-                                        insertLineBelow(lineNumber: line.leftLineNumber, side: .left)
-                                    }
-                                )
-                                .id("left-\(line.id)")
-                                .listRowInsets(EdgeInsets())
-                                .listRowSeparator(.hidden)
+                        let paneWidth = geometry.size.width / 2 - 10
+                        let scrollAxes: Axis.Set = wordWrap ? .vertical : [.horizontal, .vertical]
+                        ScrollView(scrollAxes, showsIndicators: true) {
+                            LazyVStack(alignment: .leading, spacing: 0) {
+                                ForEach(alignedLines) { line in
+                                    EditableLineRow(
+                                        line: line,
+                                        side: .left,
+                                        fontSize: fontSize,
+                                        lineHeight: lineHeight,
+                                        showLineNumbers: showLineNumbers,
+                                        wordWrap: wordWrap,
+                                        isSelected: isLineInSelectedChunk(line, side: .left),
+                                        minWidth: contentWidth(paneWidth: paneWidth),
+                                        paneWidth: paneWidth,
+                                        isEditable: isLeftEditable,
+                                        onEdit: { newText in
+                                            updateLine(lineNumber: line.leftLineNumber, newText: newText, side: .left)
+                                        },
+                                        onInsertLineBelow: { textForNewLine in
+                                            insertLineBelow(lineNumber: line.leftLineNumber, side: .left, withText: textForNewLine)
+                                        },
+                                        onDeleteLine: {
+                                            deleteLine(lineNumber: line.leftLineNumber, side: .left)
+                                        },
+                                        shouldFocus: focusedLine?.side == .left && focusedLine?.lineNumber == line.leftLineNumber,
+                                        onFocusHandled: { focusedLine = nil }
+                                    )
+                                    .id("left-\(line.id)")
+                                }
                             }
+                            .frame(minWidth: wordWrap ? nil : contentWidth(paneWidth: paneWidth), alignment: .topLeading)
                         }
-                        .listStyle(.plain)
-                        .scrollContentBackground(.hidden)
                         .background(Color(NSColor.textBackgroundColor))
                         .onChange(of: selectedChunkIndex) { _, newIndex in
-                            scrollToSelectedChunk(proxy: proxy, side: .left)
+                            if newIndex != nil {
+                                scrollToSelectedChunk(proxy: proxy, side: .left)
+                            }
                         }
                         .onAppear {
                             initializeLines()
-                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                                scrollToSelectedChunk(proxy: proxy, side: .left)
-                            }
                         }
                     }
                 }
@@ -370,40 +559,45 @@ struct AlignedDiffView: View {
                     .padding(.vertical, 6)
                     .background(Color(NSColor.controlBackgroundColor))
 
-                    // Content - fills remaining space
+                    // Content - fills remaining space with horizontal scroll support
                     ScrollViewReader { proxy in
-                        List {
-                            ForEach(alignedLines) { line in
-                                EditableLineRow(
-                                    line: line,
-                                    side: .right,
-                                    fontSize: fontSize,
-                                    lineHeight: lineHeight,
-                                    showLineNumbers: showLineNumbers,
-                                    wordWrap: wordWrap,
-                                    isSelected: isLineInSelectedChunk(line, side: .right),
-                                    minWidth: geometry.size.width / 2 - 10,
-                                    isEditable: isRightEditable,
-                                    onEdit: { newText in
-                                        updateLine(lineNumber: line.rightLineNumber, newText: newText, side: .right)
-                                    },
-                                    onInsertLineBelow: {
-                                        insertLineBelow(lineNumber: line.rightLineNumber, side: .right)
-                                    }
-                                )
-                                .id("right-\(line.id)")
-                                .listRowInsets(EdgeInsets())
-                                .listRowSeparator(.hidden)
+                        let paneWidth = geometry.size.width / 2 - 10
+                        let scrollAxes: Axis.Set = wordWrap ? .vertical : [.horizontal, .vertical]
+
+                        ScrollView(scrollAxes, showsIndicators: true) {
+                            LazyVStack(alignment: .leading, spacing: 0) {
+                                ForEach(alignedLines) { line in
+                                    EditableLineRow(
+                                        line: line,
+                                        side: .right,
+                                        fontSize: fontSize,
+                                        lineHeight: lineHeight,
+                                        showLineNumbers: showLineNumbers,
+                                        wordWrap: wordWrap,
+                                        isSelected: isLineInSelectedChunk(line, side: .right),
+                                        minWidth: contentWidth(paneWidth: paneWidth),
+                                        paneWidth: paneWidth,
+                                        isEditable: isRightEditable,
+                                        onEdit: { newText in
+                                            updateLine(lineNumber: line.rightLineNumber, newText: newText, side: .right)
+                                        },
+                                        onInsertLineBelow: { textForNewLine in
+                                            insertLineBelow(lineNumber: line.rightLineNumber, side: .right, withText: textForNewLine)
+                                        },
+                                        onDeleteLine: {
+                                            deleteLine(lineNumber: line.rightLineNumber, side: .right)
+                                        },
+                                        shouldFocus: focusedLine?.side == .right && focusedLine?.lineNumber == line.rightLineNumber,
+                                        onFocusHandled: { focusedLine = nil }
+                                    )
+                                    .id("right-\(line.id)")
+                                }
                             }
+                            .frame(minWidth: wordWrap ? nil : contentWidth(paneWidth: paneWidth), alignment: .topLeading)
                         }
-                        .listStyle(.plain)
-                        .scrollContentBackground(.hidden)
                         .background(Color(NSColor.textBackgroundColor))
                         .onChange(of: selectedChunkIndex) { _, newIndex in
-                            scrollToSelectedChunk(proxy: proxy, side: .right)
-                        }
-                        .onAppear {
-                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                            if newIndex != nil {
                                 scrollToSelectedChunk(proxy: proxy, side: .right)
                             }
                         }
@@ -412,8 +606,17 @@ struct AlignedDiffView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
-        .onChange(of: leftContent) { _, _ in initializeLines() }
-        .onChange(of: rightContent) { _, _ in initializeLines() }
+        .onChange(of: leftContent) { _, _ in
+            // Only reinitialize if we're not in the middle of an internal update
+            if !isInternalUpdate {
+                initializeLines()
+            }
+        }
+        .onChange(of: rightContent) { _, _ in
+            if !isInternalUpdate {
+                initializeLines()
+            }
+        }
     }
 
     private func initializeLines() {
@@ -422,10 +625,13 @@ struct AlignedDiffView: View {
     }
 
     @State private var debounceWorkItem: DispatchWorkItem?
+    @State private var isInternalUpdate = false
 
     private func updateLine(lineNumber: Int?, newText: String, side: DiffSide) {
         guard let num = lineNumber else { return }
         let index = num - 1  // Convert 1-based to 0-based
+
+        isInternalUpdate = true
 
         if side == .left {
             if index < leftLines.count {
@@ -439,32 +645,82 @@ struct AlignedDiffView: View {
             }
         }
 
+        // Reset flag after a brief delay to allow onChange to fire first
+        DispatchQueue.main.async {
+            isInternalUpdate = false
+        }
+
         // Debounce diff recalculation
         debounceWorkItem?.cancel()
         let workItem = DispatchWorkItem { [onContentChanged] in
             onContentChanged()
         }
         debounceWorkItem = workItem
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3, execute: workItem)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5, execute: workItem)
     }
 
-    private func insertLineBelow(lineNumber: Int?, side: DiffSide) {
-        guard let num = lineNumber else { return }
-        let index = num  // Insert after this line (0-based index = num since num is 1-based)
+    private func insertLineBelow(lineNumber: Int?, side: DiffSide, withText: String = "") {
+        guard let num = lineNumber else {
+            logger.error("insertLineBelow: lineNumber is nil!")
+            return
+        }
+        let index = num  // Insert after this line (1-based lineNumber means insert at that index)
+        let arrayCount = side == .left ? leftLines.count : rightLines.count
+
+        logger.info("insertLineBelow: lineNumber=\(num), side=\(String(describing: side), privacy: .public), arrayCount=\(arrayCount), insertAt=\(index)")
+
+        isInternalUpdate = true
 
         if side == .left {
             if index <= leftLines.count {
-                leftLines.insert("", at: index)
+                leftLines.insert(withText, at: index)
                 leftContent = leftLines.joined(separator: "\n")
+                // Set focus to newly inserted line (line number = index + 1 since 1-based)
+                focusedLine = (side: .left, lineNumber: index + 1)
+                logger.info("insertLineBelow: Inserted on left. New count: \(leftLines.count), focus line: \(index + 1)")
+            } else {
+                logger.error("insertLineBelow: Index \(index) out of bounds for left array of size \(leftLines.count)")
             }
         } else {
             if index <= rightLines.count {
-                rightLines.insert("", at: index)
+                rightLines.insert(withText, at: index)
+                rightContent = rightLines.joined(separator: "\n")
+                focusedLine = (side: .right, lineNumber: index + 1)
+            }
+        }
+
+        DispatchQueue.main.async {
+            isInternalUpdate = false
+        }
+
+        // Trigger immediate diff recalculation for new line
+        debounceWorkItem?.cancel()
+        onContentChanged()
+    }
+
+    private func deleteLine(lineNumber: Int?, side: DiffSide) {
+        guard let num = lineNumber else { return }
+        let index = num - 1  // Convert 1-based to 0-based
+
+        isInternalUpdate = true
+
+        if side == .left {
+            if index < leftLines.count && leftLines.count > 1 {
+                leftLines.remove(at: index)
+                leftContent = leftLines.joined(separator: "\n")
+            }
+        } else {
+            if index < rightLines.count && rightLines.count > 1 {
+                rightLines.remove(at: index)
                 rightContent = rightLines.joined(separator: "\n")
             }
         }
 
-        // Trigger immediate diff recalculation for new line
+        DispatchQueue.main.async {
+            isInternalUpdate = false
+        }
+
+        // Trigger immediate diff recalculation
         debounceWorkItem?.cancel()
         onContentChanged()
     }
@@ -476,20 +732,21 @@ struct AlignedDiffView: View {
         let chunk = allChunks[chunkIndex]
         let targetLine = side == .left ? chunk.leftRange.lowerBound : chunk.rightRange.lowerBound
 
-        // Find the aligned line index that corresponds to this target
-        if let alignedIndex = findAlignedIndex(forLine: targetLine, side: side, operation: chunk.operation) {
+        // Find the aligned line that corresponds to this target
+        if let alignedLine = findAlignedLine(forLine: targetLine, side: side, operation: chunk.operation) {
+            let prefix = side == .left ? "left" : "right"
             withAnimation(.easeInOut(duration: 0.2)) {
-                proxy.scrollTo("\(side == .left ? "left" : "right")-\(alignedIndex)", anchor: .top)
+                proxy.scrollTo("\(prefix)-\(alignedLine.id)", anchor: .top)
             }
         }
     }
 
-    private func findAlignedIndex(forLine lineNumber: Int, side: DiffSide, operation: DiffOperation) -> Int? {
-        for (index, aligned) in alignedLines.enumerated() {
+    private func findAlignedLine(forLine lineNumber: Int, side: DiffSide, operation: DiffOperation) -> AlignedLine? {
+        for aligned in alignedLines {
             if aligned.operation == operation {
                 let matchingLineNum = side == .left ? aligned.leftLineNumber : aligned.rightLineNumber
                 if matchingLineNum == lineNumber + 1 {  // lineNumber is 0-based, leftLineNumber is 1-based
-                    return index
+                    return aligned
                 }
             }
         }
@@ -558,9 +815,13 @@ struct EditableLineRow: View {
     let wordWrap: Bool
     let isSelected: Bool
     let minWidth: CGFloat
+    let paneWidth: CGFloat  // Used to constrain Text width for word wrap
     let isEditable: Bool
     let onEdit: (String) -> Void
-    let onInsertLineBelow: () -> Void  // Called when Enter is pressed
+    let onInsertLineBelow: (String) -> Void  // Called when Enter is pressed, with text for new line
+    let onDeleteLine: () -> Void  // Called when delete is pressed on empty line
+    var shouldFocus: Bool = false  // Whether this row should receive focus
+    var onFocusHandled: (() -> Void)? = nil  // Called after focus is handled
 
     @State private var editText: String = ""
     @State private var originalText: String = ""  // Track original to detect real changes
@@ -629,35 +890,104 @@ struct EditableLineRow: View {
                     .padding(.trailing, 4)
             }
 
-            // Content - editable or read-only based on permissions
+            // Content - editable or read-only based on permissions and word wrap
             if isPlaceholder {
                 // Placeholder - not editable, just empty space
                 Rectangle()
                     .fill(Color.clear)
-                    .frame(minWidth: minWidth - (showLineNumbers ? 47 : 0), maxWidth: .infinity)
+                    .frame(minWidth: wordWrap ? 0 : minWidth - (showLineNumbers ? 47 : 0), maxWidth: .infinity)
+            } else if wordWrap && isEditable {
+                // Word wrap mode with editing
+                let textWidth = max(100, paneWidth - (showLineNumbers ? 50 : 0) - 8)
+                let monoFont = NSFont.monospacedSystemFont(ofSize: fontSize, weight: .regular)
+                let calculatedHeight = TextHeightCalculator.height(for: editText, width: textWidth, font: monoFont)
+                EditableTextView(
+                    text: $editText,
+                    font: monoFont,
+                    textWidth: textWidth,
+                    onEnterPressed: { _ in },
+                    onTextChanged: { newText in
+                        if isInitialized && newText != originalText {
+                            onEdit(newText)
+                            originalText = newText
+                        }
+                    },
+                    onDeleteEmptyLine: {
+                        if isInitialized {
+                            onDeleteLine()
+                        }
+                    },
+                    onSplitLine: { beforeText, afterText in
+                        guard isInitialized else { return }
+                        editText = beforeText
+                        originalText = beforeText
+                        onEdit(beforeText)
+                        onInsertLineBelow(afterText)
+                    },
+                    shouldFocus: shouldFocus,
+                    onFocusHandled: onFocusHandled
+                )
+                .frame(width: textWidth, height: calculatedHeight, alignment: .topLeading)
+                .onAppear {
+                    let t = text ?? ""
+                    editText = t
+                    originalText = t
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                        isInitialized = true
+                    }
+                }
+                .onChange(of: text) { _, newValue in
+                    let t = newValue ?? ""
+                    if editText != t {
+                        editText = t
+                    }
+                    originalText = t
+                }
+            } else if wordWrap {
+                // Word wrap mode read-only - use Text
+                let textWidth = max(100, paneWidth - (showLineNumbers ? 50 : 0) - 8)
+                Text(text ?? "")
+                    .font(.system(size: fontSize, design: .monospaced))
+                    .lineLimit(nil)
+                    .frame(width: textWidth, alignment: .leading)
+                    .padding(.leading, 4)
+                    .padding(.vertical, 2)
+                    .fixedSize(horizontal: false, vertical: true)
             } else if isEditable {
-                // Editable TextField with Enter key support
+                // Editable TextField (no word wrap - horizontal scroll)
                 EditableTextField(
                     text: $editText,
                     font: NSFont.monospacedSystemFont(ofSize: fontSize, weight: .regular),
-                    wordWrap: wordWrap,
-                    onEnterPressed: {
-                        // First save any pending edit
-                        if isInitialized && editText != originalText {
-                            onEdit(editText)
-                            originalText = editText
-                        }
-                        // Then insert a new line below
-                        if isInitialized {
-                            onInsertLineBelow()
-                        }
+                    wordWrap: false,
+                    onEnterPressed: { cursorPos in
+                        guard isInitialized else { return }
+                        // Split text at cursor position
+                        let currentText = editText
+                        let splitIndex = currentText.index(currentText.startIndex, offsetBy: min(cursorPos, currentText.count))
+                        let beforeCursor = String(currentText[..<splitIndex])
+                        let afterCursor = String(currentText[splitIndex...])
+
+                        // Update current line with text before cursor
+                        editText = beforeCursor
+                        originalText = beforeCursor
+                        onEdit(beforeCursor)
+
+                        // Insert new line with text after cursor
+                        onInsertLineBelow(afterCursor)
                     },
                     onTextChanged: { newText in
                         if isInitialized && newText != originalText {
                             onEdit(newText)
                             originalText = newText
                         }
-                    }
+                    },
+                    onDeleteEmptyLine: {
+                        if isInitialized {
+                            onDeleteLine()
+                        }
+                    },
+                    shouldFocus: shouldFocus,
+                    onFocusHandled: onFocusHandled
                 )
                 .frame(minWidth: minWidth - (showLineNumbers ? 47 : 0), maxWidth: .infinity, minHeight: lineHeight)
                 .padding(.leading, 4)
@@ -671,18 +1001,20 @@ struct EditableLineRow: View {
                 }
                 .onChange(of: text) { _, newValue in
                     let t = newValue ?? ""
-                    editText = t
+                    if editText != t {
+                        editText = t
+                    }
                     originalText = t
                 }
             } else {
-                // Read-only Text
+                // Read-only Text (no word wrap)
                 Text(text ?? "")
                     .font(.system(size: fontSize, design: .monospaced))
                     .frame(minWidth: minWidth - (showLineNumbers ? 47 : 0), maxWidth: .infinity, alignment: .leading)
                     .padding(.leading, 4)
             }
         }
-        .frame(minWidth: minWidth, minHeight: lineHeight, maxHeight: lineHeight)
+        .frame(minWidth: wordWrap ? 0 : minWidth, minHeight: lineHeight, maxHeight: wordWrap ? .infinity : lineHeight)
         .background(backgroundColor)
     }
 }
@@ -694,7 +1026,14 @@ struct DiffToolbar: View {
 
     var body: some View {
         HStack {
-            // Navigation
+            // Navigation - First/Previous/Next/Last
+            Button(action: { viewModel.firstChunk() }) {
+                Image(systemName: "chevron.up.2")
+            }
+            .disabled(viewModel.chunks.isEmpty || viewModel.currentChunkIndex == 0)
+            .help("First change (⌥⌘↑)")
+            .keyboardShortcut(.upArrow, modifiers: [.command, .option])
+
             Button(action: { viewModel.previousChunk() }) {
                 Image(systemName: "chevron.up")
             }
@@ -708,6 +1047,13 @@ struct DiffToolbar: View {
             .disabled(!viewModel.hasNextChunk)
             .help("Next change (⌘↓)")
             .keyboardShortcut(.downArrow, modifiers: .command)
+
+            Button(action: { viewModel.lastChunk() }) {
+                Image(systemName: "chevron.down.2")
+            }
+            .disabled(viewModel.chunks.isEmpty || viewModel.currentChunkIndex == viewModel.chunks.count - 1)
+            .help("Last change (⌥⌘↓)")
+            .keyboardShortcut(.downArrow, modifiers: [.command, .option])
 
             Text("\(viewModel.currentChunkIndex + 1) of \(viewModel.chunks.count) changes")
                 .foregroundColor(.secondary)
@@ -737,7 +1083,8 @@ struct DiffToolbar: View {
             Button(action: { wordWrap.toggle() }) {
                 Image(systemName: wordWrap ? "text.alignleft" : "arrow.left.and.right.text.vertical")
             }
-            .help(wordWrap ? "Disable word wrap" : "Enable word wrap")
+            .help(wordWrap ? "Disable word wrap (⌘W)" : "Enable word wrap (⌘W)")
+            .keyboardShortcut("w", modifiers: .command)
 
             Divider()
                 .frame(height: 16)

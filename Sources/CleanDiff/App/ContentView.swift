@@ -131,6 +131,18 @@ struct ComparisonTabView: View {
         .task {
             await viewModel.loadAndDiff()
         }
+        .onAppear {
+            // Register viewModel with AppDelegate for unsaved changes tracking
+            if let appDelegate = NSApplication.shared.delegate as? AppDelegate {
+                appDelegate.viewModels[comparison.id] = viewModel
+            }
+        }
+        .onDisappear {
+            // Unregister when tab closes
+            if let appDelegate = NSApplication.shared.delegate as? AppDelegate {
+                appDelegate.viewModels.removeValue(forKey: comparison.id)
+            }
+        }
     }
 }
 

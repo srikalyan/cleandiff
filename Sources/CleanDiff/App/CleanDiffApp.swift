@@ -48,8 +48,10 @@ class AppState: ObservableObject {
 
 /// AppDelegate that manually creates the window for command-line launches
 @MainActor
-class AppDelegate: NSObject, NSApplicationDelegate {
+class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var window: NSWindow?
+    /// Track view models for unsaved changes check
+    var viewModels: [UUID: ComparisonViewModel] = [:]
 
     func applicationWillFinishLaunching(_ notification: Notification) {
         // Set activation policy BEFORE app finishes launching
@@ -93,10 +95,51 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         window?.contentViewController = hostingController
         window?.center()
         window?.setFrameAutosaveName("CleanDiff Main Window")
+        window?.delegate = self  // Set window delegate for close confirmation
         window?.makeKeyAndOrderFront(nil)
         window?.orderFrontRegardless()
 
         print("[AppDelegate] Window created and displayed")
+    }
+
+    // MARK: - NSWindowDelegate
+
+    func windowShouldClose(_ sender: NSWindow) -> Bool {
+        // Check for unsaved changes
+        let hasUnsaved = viewModels.values.contains { $0.hasUnsavedChanges }
+
+        if hasUnsaved {
+            let alert = NSAlert()
+            alert.messageText = "You have unsaved changes"
+            alert.informativeText = "Do you want to save your changes before closing?"
+            alert.alertStyle = .warning
+            alert.addButton(withTitle: "Save All")
+            alert.addButton(withTitle: "Don't Save")
+            alert.addButton(withTitle: "Cancel")
+
+            let response = alert.runModal()
+            switch response {
+            case .alertFirstButtonReturn:  // Save All
+                Task {
+                    for viewModel in self.viewModels.values where viewModel.hasUnsavedChanges {
+                        try? await viewModel.saveAll()
+                    }
+                    await MainActor.run {
+                        sender.close()
+                        NSApplication.shared.terminate(nil)
+                    }
+                }
+                return false  // Don't close yet, we'll close after saving
+
+            case .alertSecondButtonReturn:  // Don't Save
+                return true  // Allow close without saving
+
+            default:  // Cancel
+                return false  // Don't close
+            }
+        }
+
+        return true  // No unsaved changes, allow close
     }
 
     /// Handle command-line arguments for git difftool/mergetool

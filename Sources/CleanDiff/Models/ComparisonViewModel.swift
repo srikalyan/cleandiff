@@ -13,9 +13,9 @@ struct AlignedLine: Identifiable {
     let rightLineNumber: Int?   // nil for placeholders
     let operation: DiffOperation
 
-    // Stable ID that changes when operation changes (to trigger background refresh)
+    // Stable ID based only on index to prevent view recreation during editing
     var id: String {
-        "\(index)-\(operation)"
+        "\(index)"
     }
 }
 
@@ -35,15 +35,15 @@ class ComparisonViewModel: ObservableObject {
     @Published var rightContent: String = ""
     @Published var baseContent: String = ""
 
-    // Original content for tracking modifications
-    private var originalLeftContent: String = ""
-    private var originalRightContent: String = ""
+    // Original content for tracking modifications (published to trigger view updates)
+    @Published private var originalLeftContent: String = ""
+    @Published private var originalRightContent: String = ""
 
     // File permissions
     @Published var isLeftWritable: Bool = false
     @Published var isRightWritable: Bool = false
 
-    // Modification tracking
+    // Modification tracking - these are computed but depend on @Published properties
     var isLeftModified: Bool {
         leftContent != originalLeftContent
     }
@@ -285,6 +285,20 @@ class ComparisonViewModel: ObservableObject {
         }
     }
 
+    func firstChunk() {
+        if !chunks.isEmpty {
+            currentChunkIndex = 0
+            selectedChunkIndex = 0
+        }
+    }
+
+    func lastChunk() {
+        if !chunks.isEmpty {
+            currentChunkIndex = chunks.count - 1
+            selectedChunkIndex = currentChunkIndex
+        }
+    }
+
     // MARK: - Chunk Actions
 
     func applyChunkToRight(_ chunk: DiffChunk) {
@@ -335,15 +349,22 @@ class ComparisonViewModel: ObservableObject {
 
     func saveLeft() async throws {
         try leftContent.write(to: comparison.leftURL, atomically: true, encoding: .utf8)
+        originalLeftContent = leftContent  // Reset modified indicator
     }
 
     func saveRight() async throws {
         try rightContent.write(to: comparison.rightURL, atomically: true, encoding: .utf8)
+        originalRightContent = rightContent  // Reset modified indicator
     }
 
     func saveAll() async throws {
         try await saveLeft()
         try await saveRight()
+    }
+
+    /// Check if there are unsaved changes
+    var hasUnsavedChanges: Bool {
+        isLeftModified || isRightModified
     }
 }
 
