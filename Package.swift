@@ -27,7 +27,7 @@ let package = Package(
         // Tests
         .testTarget(
             name: "CleanDiffTests",
-            dependencies: ["CleanDiffCore"],
+            dependencies: ["CleanDiffCore", "CleanDiff"],
             path: "Tests/CleanDiffTests"
         )
     ]
