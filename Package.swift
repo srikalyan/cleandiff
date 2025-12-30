@@ -10,9 +10,7 @@ let package = Package(
         .executable(name: "cleandiff", targets: ["CleanDiff"]),
         .library(name: "CleanDiffCore", targets: ["CleanDiffCore"])
     ],
-    dependencies: [
-        .package(url: "https://github.com/nalexn/ViewInspector.git", from: "0.10.0")
-    ],
+    dependencies: [],
     targets: [
         // Core library (testable)
         .target(
@@ -29,7 +27,7 @@ let package = Package(
         // Tests
         .testTarget(
             name: "CleanDiffTests",
-            dependencies: ["CleanDiffCore", "CleanDiff", "ViewInspector"],
+            dependencies: ["CleanDiffCore", "CleanDiff"],
             path: "Tests/CleanDiffTests"
         )
     ]
