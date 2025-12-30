@@ -11,7 +11,7 @@ let package = Package(
         .library(name: "CleanDiffCore", targets: ["CleanDiffCore"])
     ],
     dependencies: [
-        .package(url: "https://github.com/nalexn/ViewInspector.git", from: "0.9.10")
+        .package(url: "https://github.com/nalexn/ViewInspector.git", from: "0.10.0")
     ],
     targets: [
         // Core library (testable)
