@@ -2,8 +2,131 @@ import SwiftUI
 import AppKit
 import CleanDiffCore
 import os
+import Combine
 
 private let logger = Logger(subsystem: "com.cleandiff", category: "editing")
+
+// MARK: - Undo/Redo Manager for NSTextView
+
+/// Manages undo/redo state by monitoring the first responder's undo manager.
+/// This bridges NSTextView's built-in undo support with SwiftUI toolbar buttons.
+@MainActor
+class UndoRedoManager: ObservableObject {
+    @Published var canUndo: Bool = false
+    @Published var canRedo: Bool = false
+
+    private var timer: Timer?
+    private var notificationObservers: [NSObjectProtocol] = []
+
+    init() {
+        startMonitoring()
+    }
+
+    deinit {
+        stopMonitoring()
+    }
+
+    private func startMonitoring() {
+        // Poll the first responder's undo manager state
+        // We use a timer because the undo manager state changes frequently
+        timer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                self?.updateUndoState()
+            }
+        }
+
+        // Also observe undo manager notifications for immediate updates
+        let undoNotification = NotificationCenter.default.addObserver(
+            forName: .NSUndoManagerDidUndoChange,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                self?.updateUndoState()
+            }
+        }
+        notificationObservers.append(undoNotification)
+
+        let redoNotification = NotificationCenter.default.addObserver(
+            forName: .NSUndoManagerDidRedoChange,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                self?.updateUndoState()
+            }
+        }
+        notificationObservers.append(redoNotification)
+
+        let checkpointNotification = NotificationCenter.default.addObserver(
+            forName: .NSUndoManagerCheckpoint,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                self?.updateUndoState()
+            }
+        }
+        notificationObservers.append(checkpointNotification)
+    }
+
+    private func stopMonitoring() {
+        timer?.invalidate()
+        timer = nil
+        for observer in notificationObservers {
+            NotificationCenter.default.removeObserver(observer)
+        }
+        notificationObservers.removeAll()
+    }
+
+    private func updateUndoState() {
+        guard let undoManager = currentUndoManager() else {
+            canUndo = false
+            canRedo = false
+            return
+        }
+        canUndo = undoManager.canUndo
+        canRedo = undoManager.canRedo
+    }
+
+    /// Get the undo manager from the current first responder (usually an NSTextView)
+    private func currentUndoManager() -> UndoManager? {
+        guard let window = NSApp.keyWindow,
+              let firstResponder = window.firstResponder else {
+            return nil
+        }
+
+        // If the first responder is an NSTextView, use its undo manager
+        if let textView = firstResponder as? NSTextView {
+            return textView.undoManager
+        }
+
+        // If it's a field editor (used by NSTextField), get its undo manager
+        if let fieldEditor = firstResponder as? NSText {
+            return fieldEditor.undoManager
+        }
+
+        return nil
+    }
+
+    /// Perform undo via the responder chain
+    func undo() {
+        NSApp.sendAction(Selector(("undo:")), to: nil, from: nil)
+        // Update state after a brief delay to let the undo complete
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
+            self?.updateUndoState()
+        }
+    }
+
+    /// Perform redo via the responder chain
+    func redo() {
+        NSApp.sendAction(Selector(("redo:")), to: nil, from: nil)
+        // Update state after a brief delay to let the redo complete
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
+            self?.updateUndoState()
+        }
+    }
+}
 
 // MARK: - Custom TextField (No Word Wrap - uses NSTextField)
 
@@ -1022,7 +1145,7 @@ struct EditableLineRow: View {
 struct DiffToolbar: View {
     @ObservedObject var viewModel: ComparisonViewModel
     @Binding var wordWrap: Bool
-    @Environment(\.undoManager) private var undoManager
+    @StateObject private var undoRedoManager = UndoRedoManager()
 
     var body: some View {
         HStack {
@@ -1061,18 +1184,18 @@ struct DiffToolbar: View {
 
             Spacer()
 
-            // Edit actions
-            Button(action: { undoManager?.undo() }) {
+            // Edit actions - using UndoRedoManager for proper NSTextView integration
+            Button(action: { undoRedoManager.undo() }) {
                 Image(systemName: "arrow.uturn.backward")
             }
-            .disabled(!(undoManager?.canUndo ?? false))
+            .disabled(!undoRedoManager.canUndo)
             .help("Undo (⌘Z)")
             .keyboardShortcut("z", modifiers: .command)
 
-            Button(action: { undoManager?.redo() }) {
+            Button(action: { undoRedoManager.redo() }) {
                 Image(systemName: "arrow.uturn.forward")
             }
-            .disabled(!(undoManager?.canRedo ?? false))
+            .disabled(!undoRedoManager.canRedo)
             .help("Redo (⌘⇧Z)")
             .keyboardShortcut("z", modifiers: [.command, .shift])
 
