@@ -5,6 +5,87 @@ import os
 
 private let logger = Logger(subsystem: "com.cleandiff", category: "editing")
 
+// MARK: - Document Undo Manager
+
+/// Document-level undo manager that tracks content changes across all lines
+class UndoManagerTracker: ObservableObject {
+    static let shared = UndoManagerTracker()
+
+    let documentUndoManager = UndoManager()
+
+    @Published var canUndo: Bool = false
+    @Published var canRedo: Bool = false
+
+    /// Callbacks to update content - set by the view
+    var onUpdateLeftContent: ((String) -> Void)?
+    var onUpdateRightContent: ((String) -> Void)?
+
+    private var observers: [NSObjectProtocol] = []
+
+    private init() {
+        let notifications: [Notification.Name] = [
+            .NSUndoManagerDidCloseUndoGroup,
+            .NSUndoManagerDidUndoChange,
+            .NSUndoManagerDidRedoChange,
+            .NSUndoManagerCheckpoint
+        ]
+
+        for name in notifications {
+            let observer = NotificationCenter.default.addObserver(
+                forName: name,
+                object: documentUndoManager,
+                queue: .main
+            ) { [weak self] _ in
+                self?.updateState()
+            }
+            observers.append(observer)
+        }
+    }
+
+    deinit {
+        observers.forEach { NotificationCenter.default.removeObserver($0) }
+    }
+
+    private func updateState() {
+        canUndo = documentUndoManager.canUndo
+        canRedo = documentUndoManager.canRedo
+    }
+
+    /// Register a content change for undo
+    func registerContentChange(oldContent: String, newContent: String, isLeft: Bool) {
+        guard oldContent != newContent else { return }
+
+        documentUndoManager.registerUndo(withTarget: self) { [weak self] target in
+            if isLeft {
+                self?.onUpdateLeftContent?(oldContent)
+            } else {
+                self?.onUpdateRightContent?(oldContent)
+            }
+            // Register redo
+            self?.registerContentChange(oldContent: newContent, newContent: oldContent, isLeft: isLeft)
+        }
+        documentUndoManager.setActionName(isLeft ? "Edit Left" : "Edit Right")
+        updateState()
+    }
+
+    func undo() {
+        guard documentUndoManager.canUndo else { return }
+        documentUndoManager.undo()
+        updateState()
+    }
+
+    func redo() {
+        guard documentUndoManager.canRedo else { return }
+        documentUndoManager.redo()
+        updateState()
+    }
+
+    /// Forces state refresh - useful after removeAllActions() which doesn't trigger notifications
+    func refreshState() {
+        updateState()
+    }
+}
+
 // MARK: - Custom TextField (No Word Wrap - uses NSTextField)
 
 struct EditableTextField: NSViewRepresentable {
@@ -306,6 +387,12 @@ struct FileDiffView: View {
     @AppStorage("showLineNumbers") private var showLineNumbers = true
     @AppStorage("wordWrap") private var wordWrap = false
 
+    // Track previous content for undo registration
+    @State private var previousLeftContent: String = ""
+    @State private var previousRightContent: String = ""
+    @State private var isUpdatingFromUndo = false
+    @State private var isInitialized = false  // Don't track changes until initial content is set
+
     var body: some View {
         VStack(spacing: 0) {
             // Toolbar
@@ -339,6 +426,74 @@ struct FileDiffView: View {
                     .padding()
                     .background(.regularMaterial)
                     .cornerRadius(8)
+            }
+        }
+        .onAppear {
+            // Clear undo history when loading new files
+            UndoManagerTracker.shared.documentUndoManager.removeAllActions()
+            UndoManagerTracker.shared.refreshState()
+
+            // Initialize previous content after a short delay to ensure content is loaded
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                previousLeftContent = viewModel.leftContent
+                previousRightContent = viewModel.rightContent
+                isInitialized = true
+            }
+
+            // Set up undo callbacks
+            UndoManagerTracker.shared.onUpdateLeftContent = { newContent in
+                isUpdatingFromUndo = true
+                viewModel.leftContent = newContent
+                previousLeftContent = newContent
+                viewModel.recalculateDiff()
+                DispatchQueue.main.async {
+                    isUpdatingFromUndo = false
+                }
+            }
+            UndoManagerTracker.shared.onUpdateRightContent = { newContent in
+                isUpdatingFromUndo = true
+                viewModel.rightContent = newContent
+                previousRightContent = newContent
+                viewModel.recalculateDiff()
+                DispatchQueue.main.async {
+                    isUpdatingFromUndo = false
+                }
+            }
+        }
+        .onChange(of: viewModel.leftContent) { oldValue, newValue in
+            // Only register undo after initialization and not during undo operations
+            guard isInitialized, !isUpdatingFromUndo else {
+                // If not initialized yet, just update the previous value
+                if !isInitialized {
+                    previousLeftContent = newValue
+                }
+                return
+            }
+            if previousLeftContent != newValue {
+                UndoManagerTracker.shared.registerContentChange(
+                    oldContent: previousLeftContent,
+                    newContent: newValue,
+                    isLeft: true
+                )
+                previousLeftContent = newValue
+            }
+        }
+        .onChange(of: viewModel.rightContent) { oldValue, newValue in
+            // Only register undo after initialization and not during undo operations
+            guard isInitialized, !isUpdatingFromUndo else {
+                // If not initialized yet, just update the previous value
+                if !isInitialized {
+                    previousRightContent = newValue
+                }
+                return
+            }
+            if previousRightContent != newValue {
+                UndoManagerTracker.shared.registerContentChange(
+                    oldContent: previousRightContent,
+                    newContent: newValue,
+                    isLeft: false
+                )
+                previousRightContent = newValue
             }
         }
     }
@@ -1022,7 +1177,7 @@ struct EditableLineRow: View {
 struct DiffToolbar: View {
     @ObservedObject var viewModel: ComparisonViewModel
     @Binding var wordWrap: Bool
-    @Environment(\.undoManager) private var undoManager
+    @ObservedObject private var undoTracker = UndoManagerTracker.shared
 
     var body: some View {
         HStack {
@@ -1061,20 +1216,28 @@ struct DiffToolbar: View {
 
             Spacer()
 
-            // Edit actions
-            Button(action: { undoManager?.undo() }) {
+            // Edit actions - document-level undo
+            Button(action: {
+                logger.info("Undo button clicked - canUndo: \(undoTracker.canUndo)")
+                undoTracker.undo()
+            }) {
                 Image(systemName: "arrow.uturn.backward")
             }
-            .disabled(!(undoManager?.canUndo ?? false))
+            .disabled(!undoTracker.canUndo)
             .help("Undo (⌘Z)")
             .keyboardShortcut("z", modifiers: .command)
+            .accessibilityIdentifier("undo-button")
 
-            Button(action: { undoManager?.redo() }) {
+            Button(action: {
+                logger.info("Redo button clicked - canRedo: \(undoTracker.canRedo)")
+                undoTracker.redo()
+            }) {
                 Image(systemName: "arrow.uturn.forward")
             }
-            .disabled(!(undoManager?.canRedo ?? false))
+            .disabled(!undoTracker.canRedo)
             .help("Redo (⌘⇧Z)")
             .keyboardShortcut("z", modifiers: [.command, .shift])
+            .accessibilityIdentifier("redo-button")
 
             Divider()
                 .frame(height: 16)
